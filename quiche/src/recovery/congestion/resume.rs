@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 use qlog::events::EventData;
 use qlog::events::resume::*;
 use crate::recovery::Acked;
+use std::convert::TryInto;
 
 const CR_EVENT_MAXIMUM_GAP: Duration = Duration::from_secs(60);
 
@@ -25,11 +26,14 @@ pub struct Resume {
     previous_rtt: Duration,
     previous_cwnd: usize,
     pipesize: usize,
+    pub total_acked: usize,
 
     #[cfg(feature = "qlog")]
     qlog_metrics: QlogMetrics,
     #[cfg(feature = "qlog")]
     last_trigger: Option<CarefulResumeTrigger>,
+
+    use_sr: bool,
 }
 
 impl std::fmt::Debug for Resume {
@@ -45,18 +49,61 @@ impl std::fmt::Debug for Resume {
 
 impl Resume {
     pub fn new(trace_id: &str) -> Self {
+
+        // enabled will become false if either of the required CR ENV VARS is not supplied
+        let mut enabled = true;
+        let mut use_sr = true;
+
+        let mut previous_rtt = Duration::ZERO;
+        let mut previous_cwnd = 0;
+
+        if let Some(jw_oss) = std::env::var_os("PREVIOUS_CWND_BYTES")
+        {
+            if let Ok(jw_string) = jw_oss.into_string() {
+                if let Ok(jw_int) = jw_string.parse::<usize>() {
+                    previous_cwnd = jw_int;
+                }
+            }
+        } else {
+            enabled = false;
+        }
+
+        if let Some(rtt_oss) = std::env::var_os("PREVIOUS_RTT") 
+        {
+            if let Ok(rtt_string) = rtt_oss.into_string() {
+                if let Ok(rtt_int) = rtt_string.parse::<usize>() {
+                    previous_rtt = Duration::from_millis(rtt_int.try_into().unwrap());
+                }
+            }
+        } else {
+            enabled = false;
+        }
+
+        if let Some(no_sr_oss) = std::env::var_os("DISABLE_SR")
+        {
+            if let Ok(no_sr_string) = no_sr_oss.into_string() {
+                if let Ok(no_sr_int) = no_sr_string.parse::<usize>() {
+                    if no_sr_int == 1 {
+                        println!("Disabling SR");
+                        use_sr = false;
+                    }
+                }
+            }
+        }
+
         Self {
             trace_id: trace_id.to_string(),
-            enabled: false,
+            enabled: enabled,
             cr_state: CrState::default(),
-            previous_rtt: Duration::ZERO,
-            previous_cwnd: 0,
+            previous_rtt: previous_rtt,
+            previous_cwnd: previous_cwnd,
             pipesize: 0,
-
+            total_acked: 0,
             #[cfg(feature = "qlog")]
             qlog_metrics: QlogMetrics::default(),
             #[cfg(feature = "qlog")]
-            last_trigger: None
+            last_trigger: None,
+            use_sr,
         }
     }
 
@@ -74,6 +121,9 @@ impl Resume {
             false
         }
     }
+    pub fn get_state(&self) -> CrState {
+        self.cr_state
+    }
 
     #[inline]
     fn change_state(&mut self, state: CrState, trigger: CarefulResumeTrigger) {
@@ -87,6 +137,7 @@ impl Resume {
     pub fn process_ack(
         &mut self, largest_pkt_sent: u64, packet: &Acked, flightsize: usize
     ) -> (Option<usize>, Option<usize>) {
+        self.total_acked += packet.size;
         match self.cr_state {
             CrState::Unvalidated(first_packet) => {
                 self.pipesize += packet.size;
@@ -128,14 +179,16 @@ impl Resume {
     }
 
     pub fn send_packet(
-        &mut self, rtt_sample: Option<Duration>, cwnd: usize, largest_pkt_sent: u64, app_limited: bool,
+        &mut self, rtt_sample: Option<Duration>, cwnd: usize, largest_pkt_sent: u64, app_limited: bool, iw_acked: bool
     ) -> usize {
         // Do nothing when data limited to avoid having insufficient data
         // to be able to validate transmission at a higher rate
         if app_limited {
             return 0;
         }
-
+        if !iw_acked {
+            return 0;
+        }
         if self.cr_state == CrState::Reconnaissance {
             let jump = (self.previous_cwnd / 2).saturating_sub(cwnd);
 
@@ -181,16 +234,27 @@ impl Resume {
 
                 // TODO: mark used CR parameters as invalid for future connections
 
-                self.change_state(CrState::SafeRetreat(largest_pkt_sent), CarefulResumeTrigger::PacketLoss);
-                self.pipesize / 2
+                if self.use_sr {
+                    self.change_state(CrState::SafeRetreat(largest_pkt_sent), CarefulResumeTrigger::PacketLoss);
+                    self.pipesize / 2
+                } else {
+                    self.change_state(CrState::Normal, CarefulResumeTrigger::PacketLoss);
+                    0
+                }
             }
             CrState::Validating(p) => {
                 trace!("{} congestion during validating phase", self.trace_id);
 
                 // TODO: mark used CR parameters as invalid for future connections
 
-                self.change_state(CrState::SafeRetreat(p), CarefulResumeTrigger::PacketLoss);
-                self.pipesize / 2
+                if self.use_sr {
+                    self.change_state(CrState::SafeRetreat(p), CarefulResumeTrigger::PacketLoss);
+                    self.pipesize / 2
+                } else {
+                    self.change_state(CrState::Normal, CarefulResumeTrigger::PacketLoss);
+                    0
+                }
+
             }
             CrState::Reconnaissance => {
                 trace!("{} congestion during reconnaissance - abandoning careful resume", self.trace_id);
@@ -386,7 +450,7 @@ mod tests {
     fn cwnd_larger_than_jump() {
         let mut r = Resume::new("");
         r.setup(Duration::from_millis(50), 80_000);
-        r.send_packet(Some(Duration::from_millis(50)), 45_000, 50, false);
+        r.send_packet(Some(Duration::from_millis(50)), 45_000, 50, false, true);
 
         assert_eq!(r.cr_state, CrState::Normal);
     }
@@ -396,7 +460,7 @@ mod tests {
     fn rtt_less_than_half() {
         let mut r = Resume::new("");
         r.setup(Duration::from_millis(50), 80_000);
-        r.send_packet(Some(Duration::from_millis(10)), 30_000, 10, false);
+        r.send_packet(Some(Duration::from_millis(10)), 30_000, 10, false, true);
 
         assert_eq!(r.cr_state, CrState::Normal);
     }
@@ -405,7 +469,7 @@ mod tests {
     fn rtt_greater_than_10() {
         let mut r = Resume::new("");
         r.setup(Duration::from_millis(50), 80_000);
-        r.send_packet(Some(Duration::from_millis(600)), 30_000, 10, false);
+        r.send_packet(Some(Duration::from_millis(600)), 30_000, 10, false, true);
 
         assert_eq!(r.cr_state, CrState::Normal);
     }
@@ -415,7 +479,7 @@ mod tests {
     fn valid_rtt() {
         let mut r = Resume::new("");
         r.setup(Duration::from_millis(50), 80_000);
-        let jump = r.send_packet(Some(Duration::from_millis(60)), 20_500, 20, false);
+        let jump = r.send_packet(Some(Duration::from_millis(60)), 20_500, 20, false, true);
         assert_eq!(jump, 19_500);
 
         assert_eq!(r.cr_state, CrState::Unvalidated(20));
@@ -682,6 +746,204 @@ mod tests {
 
         assert_eq!(r.congestion.resume.cr_state, CrState::Unvalidated(15));
         assert_eq!(r.congestion.resume.pipesize, 12_000);
+    }
+    #[test]
+    fn mj_cr_test() {
+        let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+
+        let max_datagram_size = 1350;
+
+        cfg.set_max_recv_udp_payload_size(max_datagram_size);
+        cfg.set_max_send_udp_payload_size(max_datagram_size);
+
+        cfg.set_cc_algorithm(CongestionControlAlgorithm::CUBIC);
+        cfg.enable_hystart(true);
+        cfg.enable_resume(true);
+
+        let mut r = Recovery::new(&cfg, "");
+        let mut now = Instant::now();
+
+        // Once the initial handshake is established we have an RTT sample
+        r.update_rtt(Duration::from_millis(50), Duration::from_millis(0), now);
+
+        r.setup_careful_resume(Duration::from_millis(50), 600_000);
+
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 0);
+
+        // Send packets to fill the cwnd
+        for i in 0..9 {
+            let p = Sent {
+                pkt_num: i as u64,
+                frames: smallvec![],
+                time_sent: now,
+                time_acked: None,
+                time_lost: None,
+                size: 1350,
+                ack_eliciting: true,
+                in_flight: true,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                tx_in_flight: 0,
+                lost: 0,
+                has_data: false,
+                pmtud: false,
+            };
+
+            r.on_packet_sent(
+                p,
+                packet::Epoch::Application,
+                HandshakeStatus::default(),
+                now,
+                "",
+            );
+            assert_eq!(r.congestion.sent[packet::Epoch::Application].len(), i + 1);
+            assert_eq!(r.bytes_in_flight, max_datagram_size * (i + 1));
+        }
+
+        assert_eq!(r.congestion.resume.cr_state, CrState::Reconnaissance);
+
+        // Send enough data to ensure bytes sent > cwnd
+        let p = Sent {
+            pkt_num: 10 as u64,
+            frames: smallvec![],
+            time_sent: now,
+            time_acked: None,
+            time_lost: None,
+            size: 500,
+            ack_eliciting: true,
+            in_flight: true,
+            delivered: 0,
+            delivered_time: now,
+            first_sent_time: now,
+            is_app_limited: false,
+            tx_in_flight: 0,
+            lost: 0,
+            has_data: false,
+            pmtud: false,
+        };
+
+        r.on_packet_sent(
+            p,
+            packet::Epoch::Application,
+            HandshakeStatus::default(),
+            now,
+            "",
+        );
+        assert_eq!(r.bytes_in_flight, 9 * 1350 + 500);
+
+        assert_eq!(r.congestion.resume.cr_state, CrState::Reconnaissance);
+
+        let p = Sent {
+            pkt_num: 10 as u64,
+            frames: smallvec![],
+            time_sent: now,
+            time_acked: None,
+            time_lost: None,
+            size: 850,
+            ack_eliciting: true,
+            in_flight: true,
+            delivered: 0,
+            delivered_time: now,
+            first_sent_time: now,
+            is_app_limited: false,
+            tx_in_flight: 0,
+            lost: 0,
+            has_data: false,
+            pmtud: false,
+        };
+
+        r.on_packet_sent(
+            p,
+            packet::Epoch::Application,
+            HandshakeStatus::default(),
+            now,
+            "",
+        );
+
+        assert_eq!(false, r.congestion.app_limited);
+        // make sure we are still in reconnaissance
+        assert_eq!(r.congestion.resume.cr_state, CrState::Reconnaissance);
+
+
+        let mut acked = ranges::RangeSet::default();
+        acked.insert(0..10 as u64);
+
+        now += Duration::from_millis(50);
+
+        let _ = r.congestion.on_ack_received(
+            &acked,
+            0,
+            packet::Epoch::Application,
+            HandshakeStatus::default(),
+            now,
+            "",
+            &mut Vec::new(),
+        );
+
+        // Send enough packets to fill the pipe
+        for i in 0..20 {
+            let p = Sent {
+                pkt_num: 12 + i as u64,
+                frames: smallvec![],
+                time_sent: now,
+                time_acked: None,
+                time_lost: None,
+                size: 1350,
+                ack_eliciting: true,
+                in_flight: true,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                tx_in_flight: 0,
+                lost: 0,
+                has_data: false,
+                pmtud: false,
+            };
+
+            r.on_packet_sent(
+                p,
+                packet::Epoch::Application,
+                HandshakeStatus::default(),
+                now,
+                "",
+            );
+            assert_eq!(r.bytes_in_flight, max_datagram_size * (i + 1));
+        }
+
+        let p = Sent {
+            pkt_num: 32 as u64,
+            frames: smallvec![],
+            time_sent: now,
+            time_acked: None,
+            time_lost: None,
+            size: 1350,
+            ack_eliciting: true,
+            in_flight: true,
+            delivered: 0,
+            delivered_time: now,
+            first_sent_time: now,
+            is_app_limited: false,
+            tx_in_flight: 0,
+            lost: 0,
+            has_data: false,
+            pmtud: false,
+        };
+
+        r.on_packet_sent(
+            p,
+            packet::Epoch::Application,
+            HandshakeStatus::default(),
+            now,
+            "",
+        );
+
+        assert_eq!(r.congestion.resume.cr_state, CrState::Unvalidated(31));
+        assert_eq!(r.cwnd(), 300_000);
+
+
     }
     #[test]
     fn invalid_rtt_full() {
