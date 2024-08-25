@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 use qlog::events::EventData;
 use qlog::events::resume::*;
 use crate::recovery::Acked;
+use std::convert::TryInto;
 
 const CR_EVENT_MAXIMUM_GAP: Duration = Duration::from_secs(60);
 
@@ -31,6 +32,8 @@ pub struct Resume {
     qlog_metrics: QlogMetrics,
     #[cfg(feature = "qlog")]
     last_trigger: Option<CarefulResumeTrigger>,
+
+    use_sr: bool,
 }
 
 impl std::fmt::Debug for Resume {
@@ -46,18 +49,61 @@ impl std::fmt::Debug for Resume {
 
 impl Resume {
     pub fn new(trace_id: &str) -> Self {
+
+        // enabled will become false if either of the required CR ENV VARS is not supplied
+        let mut enabled = true;
+        let mut use_sr = true;
+
+        let mut previous_rtt = Duration::ZERO;
+        let mut previous_cwnd = 0;
+
+        if let Some(jw_oss) = std::env::var_os("PREVIOUS_CWND_BYTES")
+        {
+            if let Ok(jw_string) = jw_oss.into_string() {
+                if let Ok(jw_int) = jw_string.parse::<usize>() {
+                    previous_cwnd = jw_int;
+                }
+            }
+        } else {
+            enabled = false;
+        }
+
+        if let Some(rtt_oss) = std::env::var_os("PREVIOUS_RTT") 
+        {
+            if let Ok(rtt_string) = rtt_oss.into_string() {
+                if let Ok(rtt_int) = rtt_string.parse::<usize>() {
+                    previous_rtt = Duration::from_millis(rtt_int.try_into().unwrap());
+                }
+            }
+        } else {
+            enabled = false;
+        }
+
+        if let Some(no_sr_oss) = std::env::var_os("DISABLE_SR")
+        {
+            if let Ok(no_sr_string) = no_sr_oss.into_string() {
+                if let Ok(no_sr_int) = no_sr_string.parse::<usize>() {
+                    if no_sr_int == 1 {
+                        println!("Disabling SR");
+                        use_sr = false;
+                    }
+                }
+            }
+        }
+
         Self {
             trace_id: trace_id.to_string(),
-            enabled: false,
+            enabled: enabled,
             cr_state: CrState::default(),
-            previous_rtt: Duration::ZERO,
-            previous_cwnd: 0,
+            previous_rtt: previous_rtt,
+            previous_cwnd: previous_cwnd,
             pipesize: 0,
             total_acked: 0,
             #[cfg(feature = "qlog")]
             qlog_metrics: QlogMetrics::default(),
             #[cfg(feature = "qlog")]
-            last_trigger: None
+            last_trigger: None,
+            use_sr,
         }
     }
 
@@ -188,16 +234,27 @@ impl Resume {
 
                 // TODO: mark used CR parameters as invalid for future connections
 
-                self.change_state(CrState::SafeRetreat(largest_pkt_sent), CarefulResumeTrigger::PacketLoss);
-                self.pipesize / 2
+                if self.use_sr {
+                    self.change_state(CrState::SafeRetreat(largest_pkt_sent), CarefulResumeTrigger::PacketLoss);
+                    self.pipesize / 2
+                } else {
+                    self.change_state(CrState::Normal, CarefulResumeTrigger::PacketLoss);
+                    0
+                }
             }
             CrState::Validating(p) => {
                 trace!("{} congestion during validating phase", self.trace_id);
 
                 // TODO: mark used CR parameters as invalid for future connections
 
-                self.change_state(CrState::SafeRetreat(p), CarefulResumeTrigger::PacketLoss);
-                self.pipesize / 2
+                if self.use_sr {
+                    self.change_state(CrState::SafeRetreat(p), CarefulResumeTrigger::PacketLoss);
+                    self.pipesize / 2
+                } else {
+                    self.change_state(CrState::Normal, CarefulResumeTrigger::PacketLoss);
+                    0
+                }
+
             }
             CrState::Reconnaissance => {
                 trace!("{} congestion during reconnaissance - abandoning careful resume", self.trace_id);
