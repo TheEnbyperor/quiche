@@ -1596,7 +1596,9 @@ pub struct Connection {
 
     cr_event: Option<recovery::CREvent>,
 
-    default_stream_window: Option<u64>
+    default_stream_window: Option<u64>,
+
+    using_resume: bool,
 }
 
 /// Creates a new server-side connection.
@@ -2056,6 +2058,8 @@ impl Connection {
             cr_event: None,
 
             default_stream_window: None,
+
+            using_resume: config.resume,
         };
 
         if let Some(odcid) = odcid {
@@ -2168,6 +2172,8 @@ impl Connection {
 
         self.qlog.level = level;
 
+        let time_offset = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+
         let trace = qlog::TraceSeq::new(
             qlog::VantagePoint {
                 name: None,
@@ -2177,7 +2183,7 @@ impl Connection {
             Some(title.to_string()),
             Some(description.to_string()),
             Some(qlog::Configuration {
-                time_offset: Some(0.0),
+                time_offset: Some(time_offset),
                 original_uris: None,
             }),
             None,
@@ -5349,7 +5355,7 @@ impl Connection {
     #[inline]
     pub fn stream_capacity(&self, stream_id: u64) -> Result<usize> {
         if let Some(stream) = self.streams.get(stream_id) {
-            let cap = cmp::min(self.tx_cap, stream.send.cap()?);
+            let cap = stream.send.cap()?; //cmp::min(self.tx_cap, stream.send.cap()?);
             return Ok(cap);
         };
 
@@ -7716,8 +7722,8 @@ impl Connection {
             Err(_) => 0,
         };
 
-        self.tx_cap =
-            cmp::min(cwin_available, self.max_tx_data - self.tx_data) as usize;
+        self.tx_cap = (self.max_tx_data - self.tx_data) as usize;
+            // cmp::min(cwin_available, self.max_tx_data - self.tx_data) as usize;
     }
 
     fn delivery_rate_check_if_app_limited(&self) -> bool {
